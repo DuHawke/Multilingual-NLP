@@ -41,6 +41,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from datasets import load_dataset
@@ -77,6 +78,15 @@ NER_VOCAB = {
 }
 ID2NER = {v: k for k, v in NER_VOCAB.items()}
 
+# seqeval yêu cầu format B-/I- prefix để tính F1 đúng
+# Map id → tag string với B- prefix (dùng khi tính metrics)
+ID2NER_SEQEVAL = {
+    0: 'O',
+    1: 'B-PERSON', 2: 'B-ORG',  3: 'B-LOC',
+    4: 'B-GPE',    5: 'B-DATE', 6: 'B-MONEY',
+    7: 'B-PERCENT',8: 'B-TIME', 9: 'B-QUANTITY',
+}
+
 # Map CoNLL-2003 tag string → MTT nerVocab
 # (MISC không có trong nerVocab → O)
 CONLL_TO_MTT = {
@@ -95,18 +105,23 @@ CONLL_TO_MTT = {
 @dataclass
 class Config:
     epochs:         int   = 3
-    batch_size:     int   = 16
-    lr:             float = 2e-5    # encoder lr (nhỏ hơn để giữ pretrained)
-    lr_head:        float = 1e-4    # NER head + projector + nerEmbed + decoder
+    batch_size:     int   = 4      # giảm từ 16 → 4 để tránh OOM
+    lr:             float = 2e-5
+    lr_head:        float = 1e-4
     weight_decay:   float = 0.01
     warmup_ratio:   float = 0.1
     grad_clip:      float = 1.0
     max_length:     int   = 128
     num_workers:    int   = 0
     checkpoint_dir: str   = "./checkpoints"
-    save_interval:  int   = 30      # phút
+    save_interval:  int   = 30
     resume:         Optional[str] = None
     device:         str   = "auto"
+
+    # Memory optimization
+    fp16:                   bool = True   # Mixed precision — giảm ~50% VRAM
+    gradient_checkpointing: bool = True   # Recompute activations — giảm thêm ~30%
+    grad_accum_steps:       int  = 4      # Accumulate 4 steps → effective batch = 4×4 = 16
 
     def resolve_device(self) -> torch.device:
         if self.device == "auto":
@@ -337,7 +352,7 @@ class CheckpointManager:
     @staticmethod
     def load(path: str, model, optimizer=None, scheduler=None):
         log.info(f"[CKPT] Loading {path} ...")
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         if optimizer and "optimizer_state" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -406,6 +421,26 @@ class Trainer:
         self.start_epoch  = 0
         self.history: Dict = {"train_loss": [], "val_loss": [], "val_f1": []}
 
+        # ── Memory optimizations ──────────────────────────────────────────
+        # 1. Mixed precision fp16 — giảm ~50% VRAM
+        self.scaler = GradScaler(enabled=cfg.fp16 and self.device.type == "cuda")
+
+        # 2. Gradient checkpointing — recompute activations thay vì lưu hết
+        #    Đánh đổi: tốn thêm ~33% compute nhưng giảm ~30-40% VRAM
+        if cfg.gradient_checkpointing:
+            if hasattr(model.encoder, "gradient_checkpointing_enable"):
+                model.encoder.gradient_checkpointing_enable()
+                log.info("  ✓ Gradient checkpointing: encoder ON")
+            if hasattr(model.decoder, "gradient_checkpointing_enable"):
+                model.decoder.gradient_checkpointing_enable()
+                log.info("  ✓ Gradient checkpointing: decoder ON")
+
+        # 3. Gradient accumulation — effective_batch = batch_size × grad_accum
+        self.grad_accum = cfg.grad_accum_steps
+        log.info(f"  ✓ Effective batch size: "
+                 f"{cfg.batch_size} × {cfg.grad_accum_steps} = "
+                 f"{cfg.batch_size * cfg.grad_accum_steps}")
+
         # Log thông tin model
         self._log_model_info(model, total_steps, warmup_steps)
 
@@ -445,47 +480,58 @@ class Trainer:
         total_loss, steps = 0.0, 0
         t0 = time.time()
 
+        self.optimizer.zero_grad()
+
         for step, batch in enumerate(self.train_loader):
             input_ids      = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels         = batch["labels"].to(self.device)
 
-            # ── FORWARD ────────────────────────────────────────────────
-            out  = mtt_forward(self.model, input_ids, attention_mask, labels)
-            loss = out["loss"]
+            # ── FORWARD với fp16 autocast ─────────────────────────────────
+            # float16 → giảm ~50% VRAM, tốc độ nhanh hơn trên CUDA
+            use_amp = self.cfg.fp16 and self.device.type == "cuda"
+            with autocast(enabled=use_amp):
+                out  = mtt_forward(self.model, input_ids, attention_mask, labels)
+                # Chia cho grad_accum để scale đúng khi accumulate
+                loss = out["loss"] / self.grad_accum
 
-            # ── BACKWARD ───────────────────────────────────────────────
-            # Gradient chảy end-to-end:
-            #   loss → nerClassifier → enc_hidden → encoder (mmBERT)
-            #        → projector → nerEmbed
-            #        → decoder (mT5)
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.cfg.grad_clip)
-            self.optimizer.step()
-            self.scheduler.step()
+            # ── BACKWARD ─────────────────────────────────────────────────
+            # scaler giữ gradient ở fp32 bên trong để tránh underflow
+            self.scaler.scale(loss).backward()
 
-            total_loss += loss.item()
+            total_loss += loss.item() * self.grad_accum
             steps += 1
+
+            # ── Optimizer step mỗi grad_accum steps ─────────────────────
+            # Effective batch = batch_size × grad_accum (không tốn thêm VRAM)
+            if (step + 1) % self.grad_accum == 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.cfg.grad_clip)
+                self.scaler.step(self.optimizer)   # optimizer trước
+                self.scaler.update()
+                self.optimizer.zero_grad()
+                self.scheduler.step()              # scheduler sau
 
             if step % 100 == 0:
                 lr_enc = self.optimizer.param_groups[0]["lr"]
-                lr_dec = self.optimizer.param_groups[1]["lr"]
+                mem_gb = (torch.cuda.memory_allocated() / 1e9
+                          if self.device.type == "cuda" else 0.0)
                 log.info(
                     f"  Ep{epoch} | step {step:4d}/{len(self.train_loader)} | "
-                    f"loss={loss.item():.4f} | "
-                    f"lr_enc={lr_enc:.2e} lr_dec={lr_dec:.2e} | "
+                    f"loss={loss.item()*self.grad_accum:.4f} | "
+                    f"lr={lr_enc:.2e} | "
+                    f"VRAM={mem_gb:.2f}GB | "
                     f"{time.time()-t0:.0f}s"
                 )
 
-            # Auto-save mỗi 30 phút
             self.ckpt.save_interval(
                 self.model, self.optimizer, self.scheduler,
-                epoch, step, {"train_loss": loss.item()},
+                epoch, step, {"train_loss": loss.item() * self.grad_accum},
             )
 
         return total_loss / max(steps, 1)
+
 
     # ── EVALUATE ──────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -508,8 +554,8 @@ class Trainer:
             label_np = labels.cpu().numpy()
 
             for p_seq, l_seq in zip(preds, label_np):
-                p_tags = [ID2NER[p] for p, l in zip(p_seq, l_seq) if l != -100]
-                l_tags = [ID2NER[l] for l in l_seq                 if l != -100]
+                p_tags = [ID2NER_SEQEVAL[p] for p, l in zip(p_seq, l_seq) if l != -100]
+                l_tags = [ID2NER_SEQEVAL[l] for l in l_seq                 if l != -100]
                 all_preds.append(p_tags)
                 all_labels.append(l_tags)
 
@@ -643,9 +689,16 @@ if __name__ == "__main__":
         description="Train MTT: mmBERT encoder + NER + mT5 decoder")
 
     parser.add_argument("--epochs",         type=int,   default=3)
-    parser.add_argument("--batch_size",     type=int,   default=16)
-    parser.add_argument("--lr",             type=float, default=2e-5,
-                        help="Encoder learning rate")
+    parser.add_argument("--batch_size",     type=int,   default=4,
+                        help="Micro batch size (default 4 để tránh OOM 6GB GPU)")
+    parser.add_argument("--grad_accum",     type=int,   default=4,
+                        help="Gradient accumulation steps (effective_batch = batch×accum)")
+    parser.add_argument("--fp16",           action="store_true", default=True,
+                        help="Mixed precision fp16 (giảm ~50pct VRAM)")
+    parser.add_argument("--no_fp16",        action="store_false", dest="fp16")
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
+                        help="Gradient checkpointing (giảm thêm ~30pct VRAM)")
+    parser.add_argument("--lr",             type=float, default=2e-5)
     parser.add_argument("--lr_head",        type=float, default=1e-4,
                         help="NER + decoder + projector + nerEmbed lr")
     parser.add_argument("--weight_decay",   type=float, default=0.01)
@@ -662,18 +715,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = Config(
-        epochs         = args.epochs,
-        batch_size     = args.batch_size,
-        lr             = args.lr,
-        lr_head        = args.lr_head,
-        weight_decay   = args.weight_decay,
-        warmup_ratio   = args.warmup_ratio,
-        grad_clip      = args.grad_clip,
-        max_length     = args.max_length,
-        checkpoint_dir = args.checkpoint_dir,
-        save_interval  = args.save_interval,
-        resume         = args.resume,
-        device         = args.device,
+        epochs                 = args.epochs,
+        batch_size             = args.batch_size,
+        lr                     = args.lr,
+        lr_head                = args.lr_head,
+        weight_decay           = args.weight_decay,
+        warmup_ratio           = args.warmup_ratio,
+        grad_clip              = args.grad_clip,
+        max_length             = args.max_length,
+        checkpoint_dir         = args.checkpoint_dir,
+        save_interval          = args.save_interval,
+        resume                 = args.resume,
+        device                 = args.device,
+        fp16                   = args.fp16,
+        gradient_checkpointing = args.gradient_checkpointing,
+        grad_accum_steps       = args.grad_accum,
     )
 
     main(cfg)
