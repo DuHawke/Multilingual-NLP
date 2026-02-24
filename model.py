@@ -5,97 +5,134 @@ from transformers import AutoModel, AutoTokenizer, MT5ForConditionalGeneration
 
 
 class MTT(nn.Module):
+    """
+    Multilingual Translation Transformer
+    =====================================
+    mmBERT-small (encoder)  — encode source language (1800+ ngôn ngữ)
+         ↓  projector       — align dimensions
+    mT5-small   (decoder)   — generate target language (250k vocab, đa ngôn ngữ)
+
+    Forward (teacher forcing khi train):
+      src_ids → encoder → enc_hidden → projector → enc_proj
+      tgt_ids → tgt_embed ↘
+                           decoder(cross-attn vào enc_proj) → lm_head → logits
+      loss = CrossEntropy(logits, labels)  [labels = tgt_ids shifted left]
+
+    Generate (autoregressive khi inference):
+      src_ids → encoder → enc_proj
+      [BOS] → decoder step 1 → token 1
+              decoder step 2 → token 2
+              ...
+              → [EOS] hoặc max_new_tokens
+    """
 
     ENCODER_ID = "jhu-clsp/mmBERT-small"
     DECODER_ID = "google/mt5-small"
 
-    # Label maps — dùng chung cho train và generate
-    nerVocab = {
-        'O': 0, 'PERSON': 1, 'ORG': 2, 'LOC': 3, 'GPE': 4,
-        'DATE': 5, 'MONEY': 6, 'PERCENT': 7, 'TIME': 8, 'QUANTITY': 9
-    }
-    id2ner = {        # seqeval cần B- prefix
-        0: 'O',
-        1: 'B-PERSON', 2: 'B-ORG',      3: 'B-LOC',
-        4: 'B-GPE',    5: 'B-DATE',     6: 'B-MONEY',
-        7: 'B-PERCENT',8: 'B-TIME',     9: 'B-QUANTITY',
-    }
-    conll2mtt = {     # CoNLL-2003 → nerVocab
-        'O': 'O',
-        'B-PER': 'PERSON', 'I-PER': 'PERSON',
-        'B-ORG': 'ORG',    'I-ORG': 'ORG',
-        'B-LOC': 'LOC',    'I-LOC': 'LOC',
-        'B-MISC': 'O',     'I-MISC': 'O',
-    }
-
     def __init__(self):
         super().__init__()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.ENCODER_ID)
-        self.encoder   = AutoModel.from_pretrained(self.ENCODER_ID)
+        # Hai tokenizer: src dùng mmBERT, tgt dùng mT5 (250k multilingual vocab)
+        self.src_tokenizer = AutoTokenizer.from_pretrained(self.ENCODER_ID)
+        self.tgt_tokenizer = AutoTokenizer.from_pretrained(self.DECODER_ID,
+                                                           use_fast=False)
 
+        # Encoder: mmBERT-small
+        self.encoder = AutoModel.from_pretrained(self.ENCODER_ID)
         H = self.encoder.config.hidden_size
-        self.nerEmbed      = nn.Embedding(len(self.nerVocab), H)
-        self.nerClassifier = nn.Linear(H, len(self.nerVocab))
 
-        self.decoder   = MT5ForConditionalGeneration.from_pretrained(self.DECODER_ID).decoder
-        self.projector = nn.Linear(H, self.decoder.config.hidden_size)
+        # Decoder + LM head + shared embedding: từ mT5-small
+        mt5 = MT5ForConditionalGeneration.from_pretrained(self.DECODER_ID)
+        self.decoder   = mt5.decoder    # T5Stack
+        self.lm_head   = mt5.lm_head   # Linear(d_model → 250112)
+        self.tgt_embed = mt5.shared     # Embedding(250112, d_model)
+        del mt5
 
-        for p in self.encoder.parameters():  p.requires_grad = True
-        for p in self.decoder.parameters():  p.requires_grad = True
+        # Projector: align mmBERT hidden_size → mT5 d_model
+        self.projector = nn.Linear(H, self.decoder.config.d_model)
 
-    def forward(self, input_ids, attention_mask, labels=None):
+    def forward(self, src_ids, src_mask, tgt_ids, tgt_mask=None, labels=None):
         """
-        STEP 1  encoder         → enc_hidden  (B, L, H_mm)
-        STEP 2  nerClassifier   → ner_logits  (B, L, 10)   ← loss here
-        STEP 3  projector       → enc_proj    (B, L, H_dec) for cross-attn
-        STEP 4  nerEmbed → projector → dec_input  (B, L, H_dec)
-                  teacher-forcing (true labels) khi train, argmax khi eval
-        STEP 5  decoder         → dec_hidden  (B, L, H_dec)
-
-        Backward end-to-end:
-          loss → nerClassifier → enc_hidden → encoder
-               → projector → nerEmbed → decoder
+        src_ids  : (B, S)   — source tokens (mmBERT tokenizer)
+        tgt_ids  : (B, T)   — target tokens shifted right (mT5 tokenizer)
+        labels   : (B, T)   — target tokens shifted left, -100 = ignore
         """
+        # Encode source
         enc_hidden = self.encoder(
-            input_ids=input_ids, attention_mask=attention_mask
-        ).last_hidden_state                                    # (B, L, H_mm)
+            input_ids=src_ids, attention_mask=src_mask
+        ).last_hidden_state                                  # (B, S, H_mm)
 
-        ner_logits = self.nerClassifier(enc_hidden)            # (B, L, 10)
+        enc_proj = self.projector(enc_hidden)                # (B, S, d_model)
+
+        # Decode (teacher forcing: feed ground-truth tgt_ids)
+        tgt_embeds = self.tgt_embed(tgt_ids)                 # (B, T, d_model)
+        dec_out = self.decoder(
+            inputs_embeds          = tgt_embeds,
+            attention_mask         = tgt_mask,
+            encoder_hidden_states  = enc_proj,
+            encoder_attention_mask = src_mask,
+        ).last_hidden_state                                  # (B, T, d_model)
+
+        logits = self.lm_head(dec_out)                       # (B, T, 250112)
 
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
-                ner_logits.view(-1, len(self.nerVocab)),
-                labels.view(-1), ignore_index=-100,
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
             )
 
-        enc_proj = self.projector(enc_hidden)                  # (B, L, H_dec)
+        return {"loss": loss, "logits": logits}
 
-        if labels is not None and self.training:
-            ner_ids = labels.clone()
-            ner_ids[ner_ids == -100] = 0                       # pad với O
-        else:
-            ner_ids = ner_logits.argmax(-1)
+    @torch.no_grad()
+    def generate(self, src_ids, src_mask, max_new_tokens=128, num_beams=1):
+        """
+        Autoregressive generation — greedy (num_beams=1) hoặc beam search.
 
-        dec_input  = self.projector(self.nerEmbed(ner_ids))    # (B, L, H_dec)
-        dec_hidden = self.decoder(
-            inputs_embeds          = dec_input,
-            attention_mask         = attention_mask,
-            encoder_hidden_states  = enc_proj,
-            encoder_attention_mask = attention_mask,
-        ).last_hidden_state                                    # (B, L, H_dec)
+        src_ids  : (1, S)  — đã tokenize bằng src_tokenizer
+        returns  : str     — translated text
+        """
+        self.eval()
+        device = src_ids.device
 
-        return {"loss": loss, "ner_logits": ner_logits, "dec_hidden": dec_hidden}
+        # Encode source một lần
+        enc_hidden = self.encoder(
+            input_ids=src_ids, attention_mask=src_mask
+        ).last_hidden_state
+        enc_proj = self.projector(enc_hidden)                # (1, S, d_model)
+
+        # BOS token để bắt đầu decode
+        bos_id  = self.tgt_tokenizer.pad_token_id or 0
+        eos_id  = self.tgt_tokenizer.eos_token_id
+        dec_ids = torch.tensor([[bos_id]], device=device)   # (1, 1)
+
+        for _ in range(max_new_tokens):
+            tgt_embeds = self.tgt_embed(dec_ids)
+            dec_out = self.decoder(
+                inputs_embeds         = tgt_embeds,
+                encoder_hidden_states = enc_proj,
+                encoder_attention_mask= src_mask,
+            ).last_hidden_state
+
+            next_logits  = self.lm_head(dec_out[:, -1, :])  # (1, vocab)
+            next_token   = next_logits.argmax(-1, keepdim=True)  # (1, 1)
+            dec_ids      = torch.cat([dec_ids, next_token], dim=-1)
+
+            if next_token.item() == eos_id:
+                break
+
+        tokens = dec_ids[0].tolist()
+        return self.tgt_tokenizer.decode(tokens, skip_special_tokens=True)
 
     def paramsCalc(self):
         parts = {
-            "encoder":       self.encoder,
-            "nerEmbed":      self.nerEmbed,
-            "nerClassifier": self.nerClassifier,
-            "projector":     self.projector,
-            "decoder":       self.decoder,
+            "encoder":    self.encoder,
+            "projector":  self.projector,
+            "decoder":    self.decoder,
+            "lm_head":    self.lm_head,
+            "tgt_embed":  self.tgt_embed,
         }
         for name, mod in parts.items():
-            print(f"  {name:<15}: {sum(p.numel() for p in mod.parameters()):>12,}")
-        print(f"  {'TOTAL':<15}: {sum(p.numel() for p in self.parameters()):>12,}")
+            print(f"  {name:<12}: {sum(p.numel() for p in mod.parameters()):>12,}")
+        print(f"  {'TOTAL':<12}: {sum(p.numel() for p in self.parameters()):>12,}")
