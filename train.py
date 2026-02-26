@@ -34,7 +34,7 @@ BATCH_SIZE = 1
 GRAD_ACCUM    = 8        # effective batch = 8
 LR            = 5e-5     # thấp hơn (3e-4 quá cao → loss diverge)
 WEIGHT_DECAY  = 0.01
-NUM_EPOCHS    = 5
+NUM_EPOCHS    = 50
 WARMUP_RATIO  = 0.1      # warmup dài hơn để khởi động ổn định
 CKPT_DIR      = "checkpoints"
 CKPT_INTERVAL = 30 * 60
